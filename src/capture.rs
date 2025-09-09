@@ -1,36 +1,253 @@
-// capture.rs - Screen capture using Windows Graphics Capture API
-
-use windows::{
-    core::*,
-    Graphics::Capture::*,
-    Graphics::DirectX::Direct3D11::*,
-    Graphics::DirectX::*,
-};
-use image::{RgbaImage, Rgba};
+// Screen capture functionality using Win32 BitBlt for maximum performance
 use std::path::PathBuf;
+use windows::{
+    Win32::{
+        Foundation::{HWND, RECT},
+        Graphics::Gdi::{
+            GetDC, ReleaseDC, CreateCompatibleDC, CreateCompatibleBitmap, SelectObject, BitBlt,
+            GetObjectW, GetDIBits, DeleteObject, DeleteDC, GetWindowDC, GetClientRect, GetWindowRect,
+            BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, SRCCOPY, HBITMAP, HDC, BI_RGB
+        },
+        UI::WindowsAndMessaging::{GetDesktopWindow, GetForegroundWindow},
+    },
+};
+use image::{RgbaImage, ImageBuffer};
 
-/// Captures the screen and immediately saves to disk
-/// Returns the path to the saved PNG file
-pub fn capture_screen() -> Result<PathBuf> {
-    // TODO: Implement Graphics Capture API
-    // 1. Create Direct3D device
-    // 2. Create capture item for monitor
-    // 3. Create frame pool
-    // 4. Start capture session
-    // 5. Get frame
-    // 6. Convert to image::RgbaImage
-    // 7. Save to %TEMP%\FSP\capture_[timestamp].png
-    // 8. Return filepath
+pub type CaptureResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// Capture the entire screen and save to disk immediately to minimize memory usage
+pub fn capture_screen() -> CaptureResult<PathBuf> {
+    unsafe {
+        // Get desktop window and DC
+        let desktop_hwnd = GetDesktopWindow();
+        let desktop_dc = GetDC(desktop_hwnd);
+        
+        if desktop_dc.is_invalid() {
+            return Err("Failed to get desktop DC".into());
+        }
+        
+        // Get screen dimensions
+        let screen_width = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN
+        );
+        let screen_height = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN
+        );
+        
+        // Create compatible DC and bitmap
+        let mem_dc = CreateCompatibleDC(desktop_dc);
+        let bitmap = CreateCompatibleBitmap(desktop_dc, screen_width, screen_height);
+        let old_bitmap = SelectObject(mem_dc, bitmap);
+        
+        // Copy screen to memory bitmap
+        BitBlt(
+            mem_dc,
+            0, 0,
+            screen_width, screen_height,
+            desktop_dc,
+            0, 0,
+            SRCCOPY,
+        );
+        
+        // Convert to RGBA image and save immediately
+        let image_path = save_bitmap_to_file(bitmap, screen_width as u32, screen_height as u32)?;
+        
+        // Cleanup
+        SelectObject(mem_dc, old_bitmap);
+        DeleteObject(bitmap);
+        DeleteDC(mem_dc);
+        ReleaseDC(desktop_hwnd, desktop_dc);
+        
+        Ok(image_path)
+    }
+}
+
+/// Capture specific window
+pub fn capture_window(hwnd: HWND) -> CaptureResult<PathBuf> {
+    unsafe {
+        // Get window rectangle
+        let mut rect = RECT::default();
+        GetWindowRect(hwnd, &mut rect);
+        
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        
+        if width <= 0 || height <= 0 {
+            return Err("Invalid window dimensions".into());
+        }
+        
+        // Get window DC
+        let window_dc = GetWindowDC(hwnd);
+        if window_dc.is_invalid() {
+            return Err("Failed to get window DC".into());
+        }
+        
+        // Create compatible DC and bitmap
+        let mem_dc = CreateCompatibleDC(window_dc);
+        let bitmap = CreateCompatibleBitmap(window_dc, width, height);
+        let old_bitmap = SelectObject(mem_dc, bitmap);
+        
+        // Copy window to memory bitmap
+        BitBlt(
+            mem_dc,
+            0, 0,
+            width, height,
+            window_dc,
+            0, 0,
+            SRCCOPY,
+        );
+        
+        // Save to file immediately
+        let image_path = save_bitmap_to_file(bitmap, width as u32, height as u32)?;
+        
+        // Cleanup
+        SelectObject(mem_dc, old_bitmap);
+        DeleteObject(bitmap);
+        DeleteDC(mem_dc);
+        ReleaseDC(hwnd, window_dc);
+        
+        Ok(image_path)
+    }
+}
+
+/// Get the currently active window for Alt+PrintScreen
+pub fn capture_active_window() -> CaptureResult<PathBuf> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0 == 0 {
+            return Err("No active window found".into());
+        }
+        capture_window(hwnd)
+    }
+}
+
+/// Convert Win32 bitmap to file immediately (memory-efficient approach)
+unsafe fn save_bitmap_to_file(bitmap: HBITMAP, width: u32, height: u32) -> CaptureResult<PathBuf> {
+    // Create output directory
+    let temp_dir = std::env::temp_dir().join("FSP");
+    std::fs::create_dir_all(&temp_dir)?;
     
-    todo!("Implement screen capture")
+    // Generate filename with timestamp
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let filename = format!("capture_{}.png", timestamp);
+    let file_path = temp_dir.join(filename);
+    
+    // Get bitmap info
+    let mut bmp_info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32), // Negative for top-down bitmap
+            biPlanes: 1,
+            biBitCount: 32, // 32-bit RGBA
+            biCompression: BI_RGB as u32,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [std::mem::zeroed(); 1],
+    };
+    
+    // Calculate buffer size
+    let buffer_size = (width * height * 4) as usize;
+    let mut buffer = vec![0u8; buffer_size];
+    
+    // Get bitmap bits
+    let dc = CreateCompatibleDC(HDC::default());
+    let lines = GetDIBits(
+        dc,
+        bitmap,
+        0,
+        height,
+        Some(buffer.as_mut_ptr() as *mut _),
+        &mut bmp_info,
+        DIB_RGB_COLORS,
+    );
+    DeleteDC(dc);
+    
+    if lines == 0 {
+        return Err("Failed to get bitmap data".into());
+    }
+    
+    // Convert BGRA to RGBA (Windows bitmap format is BGRA)
+    for chunk in buffer.chunks_exact_mut(4) {
+        chunk.swap(0, 2); // Swap B and R channels
+    }
+    
+    // Create image and save directly to file
+    let image = ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(width, height, buffer)
+        .ok_or("Failed to create image buffer")?;
+    
+    image.save(&file_path)?;
+    
+    Ok(file_path)
 }
 
-/// Captures a specific window
-pub fn capture_window(hwnd: HWND) -> Result<PathBuf> {
-    todo!("Implement window capture")
+/// Clean up old capture files to prevent disk space issues
+pub fn cleanup_old_captures() -> CaptureResult<()> {
+    let temp_dir = std::env::temp_dir().join("FSP");
+    
+    if !temp_dir.exists() {
+        return Ok(());
+    }
+    
+    let now = std::time::SystemTime::now();
+    let max_age = std::time::Duration::from_secs(24 * 60 * 60); // 24 hours
+    
+    for entry in std::fs::read_dir(temp_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        
+        if let Some(ext) = path.extension() {
+            if ext == "png" {
+                if let Ok(metadata) = entry.metadata() {
+                    if let Ok(created) = metadata.created() {
+                        if now.duration_since(created).unwrap_or_default() > max_age {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(())
 }
 
-/// Cleans up old capture files from temp directory
-pub fn cleanup_old_captures() -> Result<()> {
-    todo!("Implement temp file cleanup")
+/// Get list of recent captures for overlay thumbnail display
+pub fn get_recent_captures(limit: usize) -> CaptureResult<Vec<PathBuf>> {
+    let temp_dir = std::env::temp_dir().join("FSP");
+    
+    if !temp_dir.exists() {
+        return Ok(Vec::new());
+    }
+    
+    let mut captures = Vec::new();
+    
+    for entry in std::fs::read_dir(temp_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        
+        if let Some(ext) = path.extension() {
+            if ext == "png" && path.file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.starts_with("capture_")) {
+                captures.push(path);
+            }
+        }
+    }
+    
+    // Sort by modification time (newest first)
+    captures.sort_by(|a, b| {
+        let a_time = std::fs::metadata(a).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+        let b_time = std::fs::metadata(b).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+        b_time.cmp(&a_time)
+    });
+    
+    captures.truncate(limit);
+    Ok(captures)
 }

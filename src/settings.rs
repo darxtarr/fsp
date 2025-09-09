@@ -1,104 +1,60 @@
-// settings.rs - Configuration management (INI file)
-
-use std::path::PathBuf;
-use std::fs;
+// Settings management
 use image::Rgba;
 
-pub struct Settings {
-    pub presets: [Preset; 4],
-    pub output_path: PathBuf,
-    pub file_pattern: String,
-    pub auto_start: bool,
-    pub show_tray_icon: bool,
-}
-
-pub struct Preset {
+#[derive(Clone, Debug)]
+pub struct AnnotationPreset {
     pub name: String,
     pub rectangle_color: Rgba<u8>,
     pub arrow_color: Rgba<u8>,
     pub text_color: Rgba<u8>,
+    pub line_width: f32,
+}
+
+pub struct Settings {
+    pub presets: Vec<AnnotationPreset>,
+    pub current_preset: usize,
+    pub auto_start: bool,
+    pub show_tray_icon: bool,
+    pub output_path: std::path::PathBuf,
 }
 
 impl Settings {
-    /// Load settings from %APPDATA%\FSP\settings.ini
-    pub fn load() -> Self {
-        let config_path = get_config_path();
-        
-        // TODO: Parse INI file
-        // If not exists, create with defaults
-        
-        Self::default()
+    pub fn load() -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        // TODO: Load from INI file
+        Ok(Self::default())
     }
     
-    /// Save settings to INI file
-    pub fn save(&self) -> Result<(), std::io::Error> {
-        let config_path = get_config_path();
-        
-        // TODO: Write INI format
-        todo!("Implement settings save")
+    pub fn save(&self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // TODO: Save to INI file
+        Ok(())
     }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings {
-            presets: [
-                Preset {
+        Self {
+            presets: vec![
+                AnnotationPreset {
                     name: "Dark Mode".to_string(),
                     rectangle_color: Rgba([255, 0, 0, 255]),
                     arrow_color: Rgba([0, 255, 0, 255]),
                     text_color: Rgba([255, 255, 255, 255]),
+                    line_width: 2.0,
                 },
-                Preset {
+                AnnotationPreset {
                     name: "Light Mode".to_string(),
                     rectangle_color: Rgba([0, 0, 255, 255]),
                     arrow_color: Rgba([255, 0, 255, 255]),
                     text_color: Rgba([0, 0, 0, 255]),
-                },
-                Preset {
-                    name: "Custom 1".to_string(),
-                    rectangle_color: Rgba([255, 128, 0, 255]),
-                    arrow_color: Rgba([0, 128, 255, 255]),
-                    text_color: Rgba([255, 255, 0, 255]),
-                },
-                Preset {
-                    name: "Custom 2".to_string(),
-                    rectangle_color: Rgba([128, 0, 128, 255]),
-                    arrow_color: Rgba([0, 128, 128, 255]),
-                    text_color: Rgba([192, 192, 192, 255]),
+                    line_width: 2.0,
                 },
             ],
-            output_path: get_default_output_path(),
-            file_pattern: "screenshot_{timestamp}.png".to_string(),
+            current_preset: 0,
             auto_start: false,
             show_tray_icon: true,
+            output_path: std::env::var("USERPROFILE")
+                .map(|p| std::path::PathBuf::from(p).join("Pictures").join("Screenshots"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("Screenshots")),
         }
     }
-}
-
-fn get_config_path() -> PathBuf {
-    // %APPDATA%\FSP\settings.ini
-    let mut path = std::env::var("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    path.push("FSP");
-    fs::create_dir_all(&path).ok();
-    path.push("settings.ini");
-    path
-}
-
-fn get_default_output_path() -> PathBuf {
-    // %USERPROFILE%\Pictures\Screenshots
-    let mut path = std::env::var("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    path.push("Pictures");
-    path.push("Screenshots");
-    path
-}
-
-/// Parse color from hex string (#RRGGBB)
-pub fn parse_color(hex: &str) -> Option<Rgba<u8>> {
-    // TODO: Parse hex color
-    todo!("Implement color parsing")
 }
