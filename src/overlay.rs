@@ -9,7 +9,7 @@ use windows::{
             BI_RGB, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection,
             CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DIB_RGB_COLORS,
             EndPaint, FillRect, GetStockObject, InvalidateRect, NULL_BRUSH,
-            PAINTSTRUCT, PS_SOLID, Rectangle, ReleaseDC, SelectObject,
+            PAINTSTRUCT, PS_SOLID, Rectangle, SelectObject,
             SRCCOPY, HBITMAP, HDC, HBRUSH, UpdateWindow,
         },
         UI::{
@@ -36,6 +36,11 @@ pub enum Selection {
 pub struct Overlay {
     capture_path: PathBuf,
     monitor_rect: RECT,
+    // Raw BGRA pixels from the capture — used to load the GDI bitmap without
+    // a PNG decode round-trip.
+    pixels: Vec<u8>,
+    pixel_width: u32,
+    pixel_height: u32,
     screenshot_dc: HDC,
     screenshot_bitmap: HBITMAP,
     selection_result: Option<Selection>,
@@ -99,10 +104,19 @@ unsafe extern "system" fn overlay_window_proc(
 }
 
 impl Overlay {
-    pub fn new(capture_path: PathBuf, monitor_rect: RECT) -> Self {
+    pub fn new(
+        capture_path: PathBuf,
+        monitor_rect: RECT,
+        pixels: Vec<u8>,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> Self {
         Self {
             capture_path,
             monitor_rect,
+            pixels,
+            pixel_width,
+            pixel_height,
             screenshot_dc: HDC::default(),
             screenshot_bitmap: HBITMAP::default(),
             selection_result: None,
@@ -117,7 +131,13 @@ impl Overlay {
         mut self,
     ) -> std::result::Result<Selection, Box<dyn std::error::Error>> {
         unsafe {
-            let (dc, bitmap) = load_screenshot_bitmap(&self.capture_path)?;
+            // Load the screenshot into a GDI DC directly from raw pixels —
+            // no PNG decode, so the overlay appears much faster.
+            let (dc, bitmap) = load_screenshot_bitmap_from_raw(
+                &self.pixels,
+                self.pixel_width as i32,
+                self.pixel_height as i32,
+            )?;
             self.screenshot_dc = dc;
             self.screenshot_bitmap = bitmap;
 
@@ -163,8 +183,8 @@ impl Overlay {
 
             OVERLAY_INSTANCE = Some(&mut self as *mut _);
 
-            ShowWindow(self.hwnd, SW_SHOW);
-            UpdateWindow(self.hwnd);
+            let _ = ShowWindow(self.hwnd, SW_SHOW);
+            let _ = UpdateWindow(self.hwnd);
 
             let mut msg = MSG::default();
             while self.selection_result.is_none() {
@@ -172,7 +192,7 @@ impl Overlay {
                 if result.0 == 0 || result.0 == -1 {
                     break;
                 }
-                TranslateMessage(&msg);
+                let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
 
@@ -188,54 +208,66 @@ impl Overlay {
         let width = self.monitor_rect.right - self.monitor_rect.left;
         let height = self.monitor_rect.bottom - self.monitor_rect.top;
 
-        // Step 1: draw the screenshot at full brightness
-        BitBlt(dc, 0, 0, width, height, Some(self.screenshot_dc), 0, 0, SRCCOPY).ok();
+        // ── Back buffer ──────────────────────────────────────────────────────
+        // All drawing goes to back_dc; one final blit to the window DC
+        // eliminates the flicker caused by incremental screen updates.
+        let back_dc = CreateCompatibleDC(Some(dc));
+        let back_bmp = CreateCompatibleBitmap(dc, width, height);
+        let old_back = SelectObject(back_dc, back_bmp.into());
 
-        // Step 2: alpha-blend a semi-transparent black rectangle over everything
-        let dim_dc = CreateCompatibleDC(Some(dc));
-        let dim_bitmap = CreateCompatibleBitmap(dc, width, height);
-        let old_dim = SelectObject(dim_dc, dim_bitmap.into());
+        // Step 1: full screenshot at 100% brightness
+        BitBlt(back_dc, 0, 0, width, height, Some(self.screenshot_dc), 0, 0, SRCCOPY).ok();
 
+        // Step 2: semi-transparent black dim over everything
+        let dim_dc = CreateCompatibleDC(Some(back_dc));
+        let dim_bmp = CreateCompatibleBitmap(back_dc, width, height);
+        let old_dim = SelectObject(dim_dc, dim_bmp.into());
         let black_brush = CreateSolidBrush(COLORREF(0));
         let full_rect = RECT { left: 0, top: 0, right: width, bottom: height };
         FillRect(dim_dc, &full_rect, black_brush);
-        DeleteObject(black_brush.into());
-
+        let _ = DeleteObject(black_brush.into());
         let blend = BLENDFUNCTION {
-            BlendOp: 0,              // AC_SRC_OVER
+            BlendOp: 0,
             BlendFlags: 0,
             SourceConstantAlpha: 140,
             AlphaFormat: 0,
         };
-        let _ = AlphaBlend(dc, 0, 0, width, height, dim_dc, 0, 0, width, height, blend);
-
+        let _ = AlphaBlend(back_dc, 0, 0, width, height, dim_dc, 0, 0, width, height, blend);
         SelectObject(dim_dc, old_dim);
-        DeleteObject(dim_bitmap.into());
-        DeleteDC(dim_dc);
+        let _ = DeleteObject(dim_bmp.into());
+        let _ = DeleteDC(dim_dc);
 
-        // Step 3: punch through the dim for the selected area
+        // Step 3: punch the selected region through the dim
         if self.is_selecting {
-            let left  = self.start_point.x.min(self.current_point.x);
-            let top   = self.start_point.y.min(self.current_point.y);
-            let right = self.start_point.x.max(self.current_point.x);
+            let left   = self.start_point.x.min(self.current_point.x);
+            let top    = self.start_point.y.min(self.current_point.y);
+            let right  = self.start_point.x.max(self.current_point.x);
             let bottom = self.start_point.y.max(self.current_point.y);
-            let sel_w = right - left;
-            let sel_h = bottom - top;
+            let sel_w  = right - left;
+            let sel_h  = bottom - top;
 
             if sel_w > 0 && sel_h > 0 {
-                BitBlt(dc, left, top, sel_w, sel_h, Some(self.screenshot_dc), left, top, SRCCOPY).ok();
+                BitBlt(back_dc, left, top, sel_w, sel_h, Some(self.screenshot_dc), left, top, SRCCOPY).ok();
 
-                let pen = CreatePen(PS_SOLID, 2, COLORREF(0x00FFFFFF)); // white
-                let old_pen = SelectObject(dc, pen.into());
-                let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                Rectangle(dc, left, top, right, bottom);
-                SelectObject(dc, old_pen);
-                SelectObject(dc, old_brush);
-                DeleteObject(pen.into());
+                // Neon green border for maximum contrast
+                let pen = CreatePen(PS_SOLID, 2, COLORREF(0x0000FF00));
+                let old_pen   = SelectObject(back_dc, pen.into());
+                let old_brush = SelectObject(back_dc, GetStockObject(NULL_BRUSH));
+                let _ = Rectangle(back_dc, left, top, right, bottom);
+                SelectObject(back_dc, old_pen);
+                SelectObject(back_dc, old_brush);
+                let _ = DeleteObject(pen.into());
             }
         }
 
-        EndPaint(self.hwnd, &ps);
+        // Single blit → window DC (no partial updates visible to the user)
+        BitBlt(dc, 0, 0, width, height, Some(back_dc), 0, 0, SRCCOPY).ok();
+
+        SelectObject(back_dc, old_back);
+        let _ = DeleteObject(back_bmp.into());
+        let _ = DeleteDC(back_dc);
+
+        let _ = EndPaint(self.hwnd, &ps);
     }
 
     unsafe fn handle_mouse_down(&mut self, lparam: LPARAM) {
@@ -248,7 +280,7 @@ impl Overlay {
     unsafe fn handle_mouse_move(&mut self, hwnd: HWND, lparam: LPARAM) {
         self.current_point.x = (lparam.0 & 0xFFFF) as i32;
         self.current_point.y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-        InvalidateRect(Some(hwnd), None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 
     unsafe fn handle_mouse_up(&mut self, hwnd: HWND, lparam: LPARAM) {
@@ -276,8 +308,7 @@ impl Overlay {
                     image_path: path,
                 });
             }
-            Err(e) => {
-                eprintln!("FSP: Failed to crop region: {}", e);
+            Err(_) => {
                 self.selection_result = Some(Selection::Cancelled);
             }
         }
@@ -314,49 +345,35 @@ impl Overlay {
 
     unsafe fn cleanup_bitmaps(&self) {
         if !self.screenshot_dc.is_invalid() {
-            DeleteDC(self.screenshot_dc);
+            let _ = DeleteDC(self.screenshot_dc);
         }
         if !self.screenshot_bitmap.0.is_null() {
-            DeleteObject(self.screenshot_bitmap.into());
+            let _ = DeleteObject(self.screenshot_bitmap.into());
         }
     }
 }
 
-/// Load a PNG file into a GDI memory DC backed by a DIB section.
-unsafe fn load_screenshot_bitmap(
-    path: &std::path::Path,
+/// Build a GDI memory DC from raw BGRA pixel data (no file I/O, no decode).
+unsafe fn load_screenshot_bitmap_from_raw(
+    bgra: &[u8],
+    width: i32,
+    height: i32,
 ) -> std::result::Result<(HDC, HBITMAP), Box<dyn std::error::Error>> {
-    let img = image::open(path)?.to_rgba8();
-    let width = img.width() as i32;
-    let height = img.height() as i32;
-
-    let mut bgra = img.into_raw();
-    for chunk in bgra.chunks_exact_mut(4) {
-        chunk.swap(0, 2);
-    }
-
     let bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: width,
-            biHeight: -height,
+            biHeight: -height, // top-down
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB.0,
             ..Default::default()
         },
-        bmiColors: [std::mem::zeroed(); 1],
+        bmiColors: [unsafe { std::mem::zeroed() }; 1],
     };
 
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let bitmap = CreateDIBSection(
-        None,
-        &bmi,
-        DIB_RGB_COLORS,
-        &mut bits,
-        None,
-        0,
-    )?;
+    let bitmap = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)?;
 
     std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
 

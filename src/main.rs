@@ -32,8 +32,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         WM_HOTKEY => {
             match wparam.0 as i32 {
                 HOTKEY_PRINT_SCREEN => {
-                    if let Ok((path, rect)) = crate::capture::capture_monitor_at_cursor() {
-                        let _ = crate::overlay::Overlay::new(path, rect).show_and_select();
+                    if let Ok((path, rect, pixels, pw, ph)) = crate::capture::capture_monitor_at_cursor() {
+                        let _ = crate::overlay::Overlay::new(path, rect, pixels, pw, ph).show_and_select();
                         // Phase 4: wire selection result to editor + toolbar
                     }
                 }

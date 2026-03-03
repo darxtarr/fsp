@@ -6,15 +6,16 @@ use windows::{
         Graphics::Gdi::{
             BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
             GetDIBits, GetDC, GetWindowDC, ReleaseDC, SelectObject,
-            BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HBITMAP, SRCCOPY,
-            GetMonitorInfoW, MonitorFromPoint, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+            BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, SRCCOPY,
+            GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
         },
         UI::WindowsAndMessaging::{
             GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetWindowRect,
         },
     },
 };
-use image::{RgbaImage, ImageBuffer};
+use image::{ExtendedColorType, ImageEncoder};
+use image::codecs::png::{PngEncoder, CompressionType, FilterType};
 
 pub type CaptureResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -36,8 +37,9 @@ pub fn get_cursor_monitor_rect() -> CaptureResult<RECT> {
     }
 }
 
-/// Capture a specific rectangle from the virtual desktop and save to disk immediately.
-pub fn capture_rect(rect: RECT) -> CaptureResult<PathBuf> {
+/// Capture a specific rectangle from the virtual desktop and save to disk.
+/// Returns (path, raw BGRA pixels, width, height).
+pub fn capture_rect(rect: RECT) -> CaptureResult<(PathBuf, Vec<u8>, u32, u32)> {
     unsafe {
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;
@@ -59,32 +61,32 @@ pub fn capture_rect(rect: RECT) -> CaptureResult<PathBuf> {
 
         BitBlt(mem_dc, 0, 0, width, height, Some(desktop_dc), rect.left, rect.top, SRCCOPY)?;
 
-        let image_path = save_bitmap_to_file(bitmap, width as u32, height as u32)?;
+        let (image_path, raw_bgra) = save_bitmap_to_file(bitmap, width as u32, height as u32)?;
 
         SelectObject(mem_dc, old_bitmap);
-        DeleteObject(bitmap.into());
-        DeleteDC(mem_dc);
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(mem_dc);
         ReleaseDC(Some(desktop_hwnd), desktop_dc);
 
-        Ok(image_path)
+        Ok((image_path, raw_bgra, width as u32, height as u32))
     }
 }
 
-/// Capture the monitor the cursor is on. Returns the saved file path and the
-/// monitor RECT so the caller can position the overlay on the same monitor.
-pub fn capture_monitor_at_cursor() -> CaptureResult<(PathBuf, RECT)> {
+/// Capture the monitor the cursor is on.
+/// Returns (path, monitor RECT, raw BGRA pixels, width, height).
+pub fn capture_monitor_at_cursor() -> CaptureResult<(PathBuf, RECT, Vec<u8>, u32, u32)> {
     let rect = get_cursor_monitor_rect()?;
-    let path = capture_rect(rect)?;
-    Ok((path, rect))
+    let (path, pixels, w, h) = capture_rect(rect)?;
+    Ok((path, rect, pixels, w, h))
 }
 
-/// Capture the monitor the cursor is on (convenience wrapper, path only).
+/// Capture the monitor the cursor is on (path only).
 pub fn capture_screen() -> CaptureResult<PathBuf> {
-    let (path, _) = capture_monitor_at_cursor()?;
+    let (path, _, _, _, _) = capture_monitor_at_cursor()?;
     Ok(path)
 }
 
-/// Capture specific window
+/// Capture a specific window.
 pub fn capture_window(hwnd: HWND) -> CaptureResult<PathBuf> {
     unsafe {
         let mut rect = RECT::default();
@@ -108,18 +110,18 @@ pub fn capture_window(hwnd: HWND) -> CaptureResult<PathBuf> {
 
         BitBlt(mem_dc, 0, 0, width, height, Some(window_dc), 0, 0, SRCCOPY)?;
 
-        let image_path = save_bitmap_to_file(bitmap, width as u32, height as u32)?;
+        let (image_path, _) = save_bitmap_to_file(bitmap, width as u32, height as u32)?;
 
         SelectObject(mem_dc, old_bitmap);
-        DeleteObject(bitmap.into());
-        DeleteDC(mem_dc);
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(mem_dc);
         ReleaseDC(Some(hwnd), window_dc);
 
         Ok(image_path)
     }
 }
 
-/// Get the currently active window for Alt+PrintScreen
+/// Get the currently active window for Alt+PrintScreen.
 pub fn capture_active_window() -> CaptureResult<PathBuf> {
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -130,30 +132,27 @@ pub fn capture_active_window() -> CaptureResult<PathBuf> {
     }
 }
 
-/// Convert Win32 bitmap to file immediately (memory-efficient approach)
-unsafe fn save_bitmap_to_file(bitmap: HBITMAP, width: u32, height: u32) -> CaptureResult<PathBuf> {
+/// Capture raw bitmap pixels, write a fast PNG to disk, and return both the
+/// file path and the raw BGRA pixel buffer (re-used by the overlay to skip
+/// the decode step).
+unsafe fn save_bitmap_to_file(bitmap: HBITMAP, width: u32, height: u32) -> CaptureResult<(PathBuf, Vec<u8>)> {
     let temp_dir = std::env::temp_dir().join("FSP");
     std::fs::create_dir_all(&temp_dir)?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
-    let filename = format!("capture_{}.png", timestamp);
-    let file_path = temp_dir.join(filename);
+    let file_path = temp_dir.join(format!("capture_{}.png", timestamp));
 
     let mut bmp_info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: width as i32,
-            biHeight: -(height as i32), // Negative for top-down bitmap
+            biHeight: -(height as i32),
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB.0,
-            biSizeImage: 0,
-            biXPelsPerMeter: 0,
-            biYPelsPerMeter: 0,
-            biClrUsed: 0,
-            biClrImportant: 0,
+            ..Default::default()
         },
         bmiColors: [std::mem::zeroed(); 1],
     };
@@ -171,26 +170,32 @@ unsafe fn save_bitmap_to_file(bitmap: HBITMAP, width: u32, height: u32) -> Captu
         &mut bmp_info,
         DIB_RGB_COLORS,
     );
-    DeleteDC(dc);
+    let _ = DeleteDC(dc);
 
     if lines == 0 {
         return Err("Failed to get bitmap data".into());
     }
 
-    // Convert BGRA to RGBA (Windows bitmap format is BGRA)
+    // Keep raw BGRA for the overlay (avoids a PNG decode round-trip)
+    let raw_bgra = buffer.clone();
+
+    // Convert BGRA → RGBA for PNG
     for chunk in buffer.chunks_exact_mut(4) {
         chunk.swap(0, 2);
     }
 
-    let image = ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(width, height, buffer)
-        .ok_or("Failed to create image buffer")?;
+    // Fast PNG: level 1 compression, no filter — much quicker than the default
+    let file = std::fs::File::create(&file_path)?;
+    PngEncoder::new_with_quality(
+        std::io::BufWriter::new(file),
+        CompressionType::Fast,
+        FilterType::NoFilter,
+    ).write_image(&buffer, width, height, ExtendedColorType::Rgba8)?;
 
-    image.save(&file_path)?;
-
-    Ok(file_path)
+    Ok((file_path, raw_bgra))
 }
 
-/// Clean up old capture files to prevent disk space issues
+/// Clean up capture files older than 24 hours.
 pub fn cleanup_old_captures() -> CaptureResult<()> {
     let temp_dir = std::env::temp_dir().join("FSP");
 
@@ -221,7 +226,7 @@ pub fn cleanup_old_captures() -> CaptureResult<()> {
     Ok(())
 }
 
-/// Get list of recent captures for overlay thumbnail display
+/// Get list of recent captures.
 pub fn get_recent_captures(limit: usize) -> CaptureResult<Vec<PathBuf>> {
     let temp_dir = std::env::temp_dir().join("FSP");
 
