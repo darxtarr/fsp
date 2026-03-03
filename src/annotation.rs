@@ -102,7 +102,7 @@ impl Annotation {
             Annotation::Text { position, size, .. } => {
                 // Approximate text bounds
                 let text_width = size * 10.0; // Rough estimate
-                let text_height = size;
+                let text_height = *size;
                 let bounds = Rect::new(position.x, position.y, text_width, text_height);
                 bounds.contains(point)
             }

@@ -1,26 +1,26 @@
 // Overlay for region selection - covers only the monitor the cursor is on.
-// Accepts the already-captured screenshot path and monitor RECT from main.rs
-// so the same monitor is used for both capture and overlay positioning.
 use std::path::PathBuf;
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
             AlphaBlend, BeginPaint, BitBlt, BLENDFUNCTION, BITMAPINFO, BITMAPINFOHEADER,
             BI_RGB, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection,
             CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DIB_RGB_COLORS,
             EndPaint, FillRect, GetStockObject, InvalidateRect, NULL_BRUSH,
             PAINTSTRUCT, PS_SOLID, Rectangle, ReleaseDC, SelectObject,
-            SRCCOPY, COLORREF, HBITMAP, HDC, HBRUSH, RGB,
+            SRCCOPY, HBITMAP, HDC, HBRUSH, UpdateWindow,
         },
-        UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-            GetMessageW, LoadCursorW, RegisterClassW, ShowWindow, TranslateMessage,
-            UpdateWindow, IDC_CROSS, MSG, SW_SHOW, VK_ESCAPE, VK_RETURN,
-            WNDCLASSW, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-            WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WS_EX_TOPMOST, WS_POPUP,
-            CS_HREDRAW, CS_VREDRAW,
+        UI::{
+            WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+                GetMessageW, LoadCursorW, RegisterClassW, ShowWindow, TranslateMessage,
+                IDC_CROSS, MSG, SW_SHOW, WNDCLASSW, WM_DESTROY, WM_ERASEBKGND,
+                WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+                WS_EX_TOPMOST, WS_POPUP, CS_HREDRAW, CS_VREDRAW,
+            },
+            Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN},
         },
         System::LibraryLoader::GetModuleHandleW,
     },
@@ -56,7 +56,7 @@ unsafe extern "system" fn overlay_window_proc(
     if let Some(ptr) = OVERLAY_INSTANCE {
         let overlay = &mut *ptr;
         match msg {
-            WM_ERASEBKGND => LRESULT(1), // we paint everything - tell Windows not to erase
+            WM_ERASEBKGND => LRESULT(1),
             WM_PAINT => {
                 overlay.handle_paint();
                 LRESULT(0)
@@ -79,7 +79,7 @@ unsafe extern "system" fn overlay_window_proc(
                 let vk = wparam.0 as u16;
                 if vk == VK_ESCAPE.0 {
                     overlay.selection_result = Some(Selection::Cancelled);
-                    DestroyWindow(hwnd);
+                    let _ = DestroyWindow(hwnd);
                 } else if vk == VK_RETURN.0 {
                     overlay.handle_full_screen_selection(hwnd);
                 } else {
@@ -117,7 +117,6 @@ impl Overlay {
         mut self,
     ) -> std::result::Result<Selection, Box<dyn std::error::Error>> {
         unsafe {
-            // Load screenshot into GDI bitmap once - reused on every WM_PAINT
             let (dc, bitmap) = load_screenshot_bitmap(&self.capture_path)?;
             self.screenshot_dc = dc;
             self.screenshot_bitmap = bitmap;
@@ -140,25 +139,27 @@ impl Overlay {
             let height = self.monitor_rect.bottom - self.monitor_rect.top;
             let window_name: Vec<u16> = "FSP Overlay\0".encode_utf16().collect();
 
-            self.hwnd = CreateWindowExW(
-                WS_EX_TOPMOST,              // no WS_EX_LAYERED - we paint everything ourselves
+            let hwnd = match CreateWindowExW(
+                WS_EX_TOPMOST,
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(window_name.as_ptr()),
                 WS_POPUP,
-                self.monitor_rect.left,     // positioned exactly on the right monitor
+                self.monitor_rect.left,
                 self.monitor_rect.top,
                 width,
                 height,
-                HWND::default(),
                 None,
-                hinstance,
                 None,
-            );
-
-            if self.hwnd.0 == 0 {
-                self.cleanup_bitmaps();
-                return Err("Failed to create overlay window".into());
-            }
+                Some(hinstance.into()),
+                None,
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    self.cleanup_bitmaps();
+                    return Err("Failed to create overlay window".into());
+                }
+            };
+            self.hwnd = hwnd;
 
             OVERLAY_INSTANCE = Some(&mut self as *mut _);
 
@@ -188,31 +189,31 @@ impl Overlay {
         let height = self.monitor_rect.bottom - self.monitor_rect.top;
 
         // Step 1: draw the screenshot at full brightness
-        BitBlt(dc, 0, 0, width, height, self.screenshot_dc, 0, 0, SRCCOPY);
+        BitBlt(dc, 0, 0, width, height, Some(self.screenshot_dc), 0, 0, SRCCOPY).ok();
 
         // Step 2: alpha-blend a semi-transparent black rectangle over everything
-        let dim_dc = CreateCompatibleDC(dc);
+        let dim_dc = CreateCompatibleDC(Some(dc));
         let dim_bitmap = CreateCompatibleBitmap(dc, width, height);
-        let old_dim = SelectObject(dim_dc, dim_bitmap);
+        let old_dim = SelectObject(dim_dc, dim_bitmap.into());
 
         let black_brush = CreateSolidBrush(COLORREF(0));
         let full_rect = RECT { left: 0, top: 0, right: width, bottom: height };
         FillRect(dim_dc, &full_rect, black_brush);
-        DeleteObject(black_brush);
+        DeleteObject(black_brush.into());
 
         let blend = BLENDFUNCTION {
-            BlendOp: 0,              // AC_SRC_OVER = 0
+            BlendOp: 0,              // AC_SRC_OVER
             BlendFlags: 0,
-            SourceConstantAlpha: 140, // ~55% opacity - dims without going pitch black
-            AlphaFormat: 0,          // no per-pixel alpha in our source
+            SourceConstantAlpha: 140,
+            AlphaFormat: 0,
         };
-        AlphaBlend(dc, 0, 0, width, height, dim_dc, 0, 0, width, height, blend);
+        let _ = AlphaBlend(dc, 0, 0, width, height, dim_dc, 0, 0, width, height, blend);
 
         SelectObject(dim_dc, old_dim);
-        DeleteObject(dim_bitmap);
+        DeleteObject(dim_bitmap.into());
         DeleteDC(dim_dc);
 
-        // Step 3: if selecting, punch through the dim for the selected area
+        // Step 3: punch through the dim for the selected area
         if self.is_selecting {
             let left  = self.start_point.x.min(self.current_point.x);
             let top   = self.start_point.y.min(self.current_point.y);
@@ -222,17 +223,15 @@ impl Overlay {
             let sel_h = bottom - top;
 
             if sel_w > 0 && sel_h > 0 {
-                // Restore original screenshot pixels inside the selection
-                BitBlt(dc, left, top, sel_w, sel_h, self.screenshot_dc, left, top, SRCCOPY);
+                BitBlt(dc, left, top, sel_w, sel_h, Some(self.screenshot_dc), left, top, SRCCOPY).ok();
 
-                // Draw a crisp 2px white border around the selection
-                let pen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
-                let old_pen = SelectObject(dc, pen);
+                let pen = CreatePen(PS_SOLID, 2, COLORREF(0x00FFFFFF)); // white
+                let old_pen = SelectObject(dc, pen.into());
                 let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
                 Rectangle(dc, left, top, right, bottom);
                 SelectObject(dc, old_pen);
                 SelectObject(dc, old_brush);
-                DeleteObject(pen);
+                DeleteObject(pen.into());
             }
         }
 
@@ -249,8 +248,7 @@ impl Overlay {
     unsafe fn handle_mouse_move(&mut self, hwnd: HWND, lparam: LPARAM) {
         self.current_point.x = (lparam.0 & 0xFFFF) as i32;
         self.current_point.y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-        // Force a full repaint so the selection rectangle updates live
-        InvalidateRect(hwnd, None, false);
+        InvalidateRect(Some(hwnd), None, false);
     }
 
     unsafe fn handle_mouse_up(&mut self, hwnd: HWND, lparam: LPARAM) {
@@ -266,7 +264,6 @@ impl Overlay {
         let width  = (self.start_point.x.max(self.current_point.x) - left) as u32;
         let height = (self.start_point.y.max(self.current_point.y) - top) as u32;
 
-        // Tiny or zero drag = treat as full screen selection
         if width < 5 && height < 5 {
             self.handle_full_screen_selection(hwnd);
             return;
@@ -284,15 +281,14 @@ impl Overlay {
                 self.selection_result = Some(Selection::Cancelled);
             }
         }
-        DestroyWindow(hwnd);
+        let _ = DestroyWindow(hwnd);
     }
 
     unsafe fn handle_full_screen_selection(&mut self, hwnd: HWND) {
-        // No second capture needed - the full monitor is already captured
         self.selection_result = Some(Selection::FullScreen {
             image_path: self.capture_path.clone(),
         });
-        DestroyWindow(hwnd);
+        let _ = DestroyWindow(hwnd);
     }
 
     fn crop_region(
@@ -302,7 +298,6 @@ impl Overlay {
         width: u32,
         height: u32,
     ) -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
-        // Crop directly from the already-captured file - no second screen capture
         let img = image::open(&self.capture_path)?;
         let cropped = img.crop_imm(x as u32, y as u32, width, height);
 
@@ -321,14 +316,13 @@ impl Overlay {
         if !self.screenshot_dc.is_invalid() {
             DeleteDC(self.screenshot_dc);
         }
-        if self.screenshot_bitmap.0 != 0 {
-            DeleteObject(self.screenshot_bitmap);
+        if !self.screenshot_bitmap.0.is_null() {
+            DeleteObject(self.screenshot_bitmap.into());
         }
     }
 }
 
 /// Load a PNG file into a GDI memory DC backed by a DIB section.
-/// Loaded once per overlay session and reused on every WM_PAINT.
 unsafe fn load_screenshot_bitmap(
     path: &std::path::Path,
 ) -> std::result::Result<(HDC, HBITMAP), Box<dyn std::error::Error>> {
@@ -336,7 +330,6 @@ unsafe fn load_screenshot_bitmap(
     let width = img.width() as i32;
     let height = img.height() as i32;
 
-    // Windows DIBs expect BGRA - image crate gives RGBA - swap R and B
     let mut bgra = img.into_raw();
     for chunk in bgra.chunks_exact_mut(4) {
         chunk.swap(0, 2);
@@ -346,10 +339,10 @@ unsafe fn load_screenshot_bitmap(
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: width,
-            biHeight: -height, // negative = top-down, matches our capture orientation
+            biHeight: -height,
             biPlanes: 1,
             biBitCount: 32,
-            biCompression: BI_RGB as u32,
+            biCompression: BI_RGB.0,
             ..Default::default()
         },
         bmiColors: [std::mem::zeroed(); 1],
@@ -357,19 +350,18 @@ unsafe fn load_screenshot_bitmap(
 
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
     let bitmap = CreateDIBSection(
-        HDC::default(),      // null DC is fine for an RGB DIB (no palette needed)
+        None,
         &bmi,
         DIB_RGB_COLORS,
         &mut bits,
-        HANDLE::default(),   // no file mapping section - use heap
+        None,
         0,
     )?;
 
     std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
 
-    // Create the memory DC and select our bitmap into it
-    let mem_dc = CreateCompatibleDC(HDC::default());
-    SelectObject(mem_dc, bitmap);
+    let mem_dc = CreateCompatibleDC(None);
+    SelectObject(mem_dc, bitmap.into());
 
     Ok((mem_dc, bitmap))
 }
