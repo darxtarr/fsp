@@ -6,7 +6,7 @@
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             WindowsAndMessaging::*,
@@ -32,20 +32,37 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         WM_HOTKEY => {
             match wparam.0 as i32 {
                 HOTKEY_PRINT_SCREEN => {
-                    println!("PrintScreen hotkey triggered!");
-                    match crate::capture::capture_screen() {
-                        Ok(path) => println!("Screenshot saved to: {:?}", path),
-                        Err(e) => eprintln!("Screenshot failed: {}", e),
+                    if let Ok((path, rect)) = crate::capture::capture_monitor_at_cursor() {
+                        let _ = crate::overlay::Overlay::new(path, rect).show_and_select();
+                        // Phase 4: wire selection result to editor + toolbar
                     }
                 }
                 HOTKEY_ALT_PRINT_SCREEN => {
-                    println!("Alt+PrintScreen hotkey triggered!");
-                    match crate::capture::capture_active_window() {
-                        Ok(path) => println!("Window screenshot saved to: {:?}", path),
-                        Err(e) => eprintln!("Window screenshot failed: {}", e),
-                    }
+                    // Capture active window; editor wired in Phase 4
+                    let _ = crate::capture::capture_active_window();
                 }
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_TRAY_ICON => {
+            if lparam.0 as u32 == WM_RBUTTONUP {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                if let Ok(menu) = CreatePopupMenu() {
+                    let exit_label: Vec<u16> = "Exit\0".encode_utf16().collect();
+                    AppendMenuW(menu, MF_STRING, 1usize, PCWSTR(exit_label.as_ptr())).ok();
+                    let _ = SetForegroundWindow(hwnd);
+                    let cmd = TrackPopupMenu(
+                        menu,
+                        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                        pt.x, pt.y, 0, hwnd, None,
+                    );
+                    DestroyMenu(menu).ok();
+                    if cmd.0 == 1 {
+                        PostQuitMessage(0);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -62,29 +79,24 @@ fn main() -> windows::core::Result<()> {
         let hinstance = GetModuleHandleW(None)?;
 
         // Register window class
-        let class_name = "FSP_WindowClass\0";
-        let class_name_wide: Vec<u16> = class_name.encode_utf16().collect();
-
+        let class_name: Vec<u16> = "FSP_WindowClass\0".encode_utf16().collect();
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(window_proc),
             hInstance: hinstance.into(),
             hbrBackground: CreateSolidBrush(COLORREF(0)),
-            lpszClassName: PCWSTR(class_name_wide.as_ptr()),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             ..Default::default()
         };
-
         RegisterClassW(&wc);
 
-        // Create message-only window
-        let window_name = "FSP\0";
-        let window_name_wide: Vec<u16> = window_name.encode_utf16().collect();
-
+        // Create message-only window (no visible UI, just receives messages)
+        let window_name: Vec<u16> = "FSP\0".encode_utf16().collect();
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
-            PCWSTR(class_name_wide.as_ptr()),
-            PCWSTR(window_name_wide.as_ptr()),
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(window_name.as_ptr()),
             WS_OVERLAPPED,
             0, 0, 0, 0,
             Some(HWND_MESSAGE),
@@ -93,7 +105,7 @@ fn main() -> windows::core::Result<()> {
             None,
         )?;
 
-        // Register hotkeys - ignore failures for now
+        // Register hotkeys
         let _ = RegisterHotKey(Some(hwnd), HOTKEY_PRINT_SCREEN, HOT_KEY_MODIFIERS(0), VK_SNAPSHOT.0 as u32);
         let _ = RegisterHotKey(Some(hwnd), HOTKEY_ALT_PRINT_SCREEN, MOD_ALT, VK_SNAPSHOT.0 as u32);
 
@@ -104,19 +116,13 @@ fn main() -> windows::core::Result<()> {
         nid.uID = 1;
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY_ICON;
-
-        let tooltip = "FSP - Fast Screenshot Program\0";
-        let tooltip_wide: Vec<u16> = tooltip.encode_utf16().collect();
-        let copy_len = tooltip_wide.len().min(127);
-        for (i, &ch) in tooltip_wide.iter().take(copy_len).enumerate() {
+        let tooltip: Vec<u16> = "FSP - Fast Screenshot Program\0".encode_utf16().collect();
+        let copy_len = tooltip.len().min(127);
+        for (i, &ch) in tooltip.iter().take(copy_len).enumerate() {
             nid.szTip[i] = ch;
         }
-        nid.szTip[copy_len] = 0;
-
         nid.hIcon = LoadIconW(None, IDI_APPLICATION)?;
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
-
-        println!("FSP started successfully. Press PrintScreen to capture!");
 
         // Message pump
         let mut msg = MSG::default();
