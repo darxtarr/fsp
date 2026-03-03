@@ -184,7 +184,12 @@ unsafe fn save_bitmap_to_file(bitmap: HBITMAP, width: u32, height: u32) -> Captu
         chunk.swap(0, 2);
     }
 
-    // Fast PNG: level 1 compression, no filter — much quicker than the default
+    // TODO(perf): Fast compression trades speed for file size — a full-monitor
+    // capture at 1080p+ easily hits 10 MB. Consider a two-phase approach:
+    // write Fast now so the overlay appears immediately, then re-compress
+    // aggressively in a background thread while the user annotates or after
+    // the session ends. Balance point TBD (Deflate level 6 ~3–4× smaller,
+    // ~2–3× slower; also worth evaluating QOI for lossless speed).
     let file = std::fs::File::create(&file_path)?;
     PngEncoder::new_with_quality(
         std::io::BufWriter::new(file),
@@ -194,6 +199,15 @@ unsafe fn save_bitmap_to_file(bitmap: HBITMAP, width: u32, height: u32) -> Captu
 
     Ok((file_path, raw_bgra))
 }
+
+// TODO(security): %TEMP%\FSP accumulates full-monitor PNGs indefinitely if
+// the user never cleans up. A week of screenshots is a significant data
+// exposure risk — any process or person with file-system access to this user
+// account can read them. Security model to be decided in a dedicated session:
+// options include DPAPI encryption, a master-password + AES scheme, moving
+// storage to %APPDATA% with tighter ACLs, and/or automatic retention limits.
+// At minimum, enforce a short auto-expiry (e.g. 24 h) and surface a "clean up
+// now" action in the tray menu so the user is never sitting on stale captures.
 
 /// Clean up capture files older than 24 hours.
 pub fn cleanup_old_captures() -> CaptureResult<()> {
