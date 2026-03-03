@@ -56,7 +56,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     let cmd = TrackPopupMenu(
                         menu,
                         TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                        pt.x, pt.y, 0, hwnd, None,
+                        pt.x, pt.y, Some(0), hwnd, None,
                     );
                     DestroyMenu(menu).ok();
                     if cmd.0 == 1 {
