@@ -241,4 +241,83 @@ Open in... → rasterize → launch external app with temp file
 Editor and toolbar close. Back to tray icon, idle.
 ```
 
+---
 
+## Open Issues — Deferred to Dedicated Sessions
+
+The two topics below were identified during implementation and deliberately left
+unresolved. Each needs a focused design pass before any code is written.
+
+---
+
+### OI-1 · Security Model for Captured Screenshots
+
+**Current state (temporary):**
+Full-monitor PNG captures accumulate indefinitely in `%TEMP%\FSP\`. Files are
+written immediately to disk and never held in RAM (by design — see memory rules),
+which means the folder can grow to days or weeks of screenshots with no automatic
+cleanup.
+
+**Why this is a real risk:**
+A single week of full-monitor captures is a significant data exposure surface.
+Any process or person with file-system access to the current Windows user account
+can open and read them. ISRM teams correctly flag this regardless of the "but you
+could do more damage with the account anyway" argument — policy is policy.
+
+**Options identified (not yet evaluated):**
+
+| Option | Protection level | UX cost | Complexity |
+|---|---|---|---|
+| Short auto-expiry (e.g. 24 h) + tray "Clean up now" | Minimal | None | Low |
+| Move storage to `%APPDATA%\FSP\captures\` | No encryption, but less exposed than TEMP | None | Trivial |
+| Windows DPAPI encryption | Files tied to current Windows login; unreadable to other OS users or on other machines. No separate password. | None (transparent) | Medium |
+| Master password + AES-256-GCM | Files unreadable even to someone with the Windows account. Survives account sharing. | Password prompt at launch | High |
+
+**Likely direction (to be confirmed):**
+A layered approach — short retention limit (24 h hard cap) + DPAPI encryption as
+the baseline, with an opt-in master-password layer for high-security users. The
+tray menu should always surface a "Delete all captures now" action.
+
+**TODO (code):** see `capture.rs` above `cleanup_old_captures()` for the inline note.
+
+---
+
+### OI-2 · Internal Image Format: Speed vs. File Size
+
+**Current state (temporary):**
+Captures are written as PNG with `CompressionType::Fast` + `FilterType::NoFilter`.
+This keeps the overlay latency acceptable but produces large files — a typical
+1080p+ full-monitor capture lands around 10 MB. A 4K capture can hit 20–30 MB.
+
+**The real problem:**
+The current flow does PNG twice — fast-write for the overlay, and again when the
+user exports the cropped region. We are paying the PNG tax on the full monitor
+even though the user usually exports only a small region.
+
+**Ideas in play (none researched properly yet):**
+
+1. **Two-phase compression:** Write with `Fast` now so the overlay appears
+   immediately, then re-compress to level 6+ in a background thread while the
+   user annotates. The re-compressed file replaces the fast one before export.
+   Zero UX impact if annotation takes > 1 s (it always does).
+
+2. **Fast internal format, PNG only at export:** Store the full-monitor capture in
+   a lossless-but-fast intermediate format (candidates: QOI, raw BGRA + header,
+   uncompressed BMP) and only produce a PNG when the user crops and exports.
+   The internal file is ephemeral and deleted after the session.
+
+3. **Only save the selected region:** After the user draws the crop rectangle,
+   discard everything outside it and write only the cropped PNG. Eliminates the
+   full-frame overhead entirely. Downside: user cannot re-crop after closing the
+   overlay.
+
+**Format research needed (SOTA as of early 2026):**
+No homework done yet. Before deciding, evaluate: QOI (simple, fast, ~20 % larger
+than PNG-6), AVIF lossless (very dense, slow encoder), JXL lossless (dense + fast
+decode, moderate encode), WebP lossless (good tooling), raw BGRA (fastest but
+largest — ~14 MB for 1080p, ~33 MB for 4K). Decision should be driven by
+encode-speed benchmarks on a typical CloudPC CPU, not desktop benchmarks.
+
+**TODO (code):** see `capture.rs` inside `save_bitmap_to_file()` for the inline note.
+
+---
