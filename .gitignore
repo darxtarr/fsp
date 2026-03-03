@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Windows build outputs
+*.pdb
+*.obj
+*.lib
+
+# Release packaging
+/dist/
+/release/
+
+# OS noise
+Thumbs.db
+Desktop.ini
+.DS_Store

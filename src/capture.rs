@@ -2,64 +2,92 @@
 use std::path::PathBuf;
 use windows::{
     Win32::{
-        Foundation::{HWND, RECT},
+        Foundation::{HWND, POINT, RECT},
         Graphics::Gdi::{
-            GetDC, ReleaseDC, CreateCompatibleDC, CreateCompatibleBitmap, SelectObject, BitBlt,
-            GetObjectW, GetDIBits, DeleteObject, DeleteDC, GetWindowDC, GetClientRect, GetWindowRect,
-            BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, SRCCOPY, HBITMAP, HDC, BI_RGB
+            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+            GetDIBits, GetDC, GetWindowDC, GetWindowRect, ReleaseDC, SelectObject,
+            BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HBITMAP, SRCCOPY,
         },
-        UI::WindowsAndMessaging::{GetDesktopWindow, GetForegroundWindow},
+        UI::WindowsAndMessaging::{
+            GetCursorPos, GetDesktopWindow, GetForegroundWindow,
+            GetMonitorInfoW, MonitorFromPoint,
+            HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        },
     },
 };
 use image::{RgbaImage, ImageBuffer};
 
 pub type CaptureResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Capture the entire screen and save to disk immediately to minimize memory usage
-pub fn capture_screen() -> CaptureResult<PathBuf> {
+/// Get the bounding RECT of whichever monitor the cursor is currently on.
+/// This is the single source of truth for monitor selection - call it once
+/// at hotkey time and pass the result to both capture and overlay.
+pub fn get_cursor_monitor_rect() -> CaptureResult<RECT> {
     unsafe {
-        // Get desktop window and DC
+        let mut cursor_pos = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut cursor_pos)?;
+
+        let hmonitor = MonitorFromPoint(cursor_pos, MONITOR_DEFAULTTONEAREST);
+
+        let mut monitor_info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        GetMonitorInfoW(hmonitor, &mut monitor_info)?;
+
+        Ok(monitor_info.rcMonitor)
+    }
+}
+
+/// Capture a specific rectangle from the virtual desktop and save to disk immediately.
+/// The rect is in virtual screen coordinates (as returned by GetMonitorInfo).
+pub fn capture_rect(rect: RECT) -> CaptureResult<PathBuf> {
+    unsafe {
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+
+        if width <= 0 || height <= 0 {
+            return Err("Invalid capture dimensions".into());
+        }
+
         let desktop_hwnd = GetDesktopWindow();
         let desktop_dc = GetDC(desktop_hwnd);
-        
+
         if desktop_dc.is_invalid() {
             return Err("Failed to get desktop DC".into());
         }
-        
-        // Get screen dimensions
-        let screen_width = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-            windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN
-        );
-        let screen_height = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-            windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN
-        );
-        
-        // Create compatible DC and bitmap
+
         let mem_dc = CreateCompatibleDC(desktop_dc);
-        let bitmap = CreateCompatibleBitmap(desktop_dc, screen_width, screen_height);
+        let bitmap = CreateCompatibleBitmap(desktop_dc, width, height);
         let old_bitmap = SelectObject(mem_dc, bitmap);
-        
-        // Copy screen to memory bitmap
-        BitBlt(
-            mem_dc,
-            0, 0,
-            screen_width, screen_height,
-            desktop_dc,
-            0, 0,
-            SRCCOPY,
-        );
-        
-        // Convert to RGBA image and save immediately
-        let image_path = save_bitmap_to_file(bitmap, screen_width as u32, screen_height as u32)?;
-        
-        // Cleanup
+
+        // Blit from the monitor's position in virtual screen coordinates
+        BitBlt(mem_dc, 0, 0, width, height, desktop_dc, rect.left, rect.top, SRCCOPY);
+
+        let image_path = save_bitmap_to_file(bitmap, width as u32, height as u32)?;
+
         SelectObject(mem_dc, old_bitmap);
         DeleteObject(bitmap);
         DeleteDC(mem_dc);
         ReleaseDC(desktop_hwnd, desktop_dc);
-        
+
         Ok(image_path)
     }
+}
+
+/// Capture the monitor the cursor is on. Returns the saved file path and the
+/// monitor RECT so the caller can position the overlay on the same monitor.
+pub fn capture_monitor_at_cursor() -> CaptureResult<(PathBuf, RECT)> {
+    let rect = get_cursor_monitor_rect()?;
+    let path = capture_rect(rect)?;
+    Ok((path, rect))
+}
+
+/// Capture the monitor the cursor is on (convenience wrapper, path only).
+/// Kept for any legacy callers - prefer capture_monitor_at_cursor() in new code.
+pub fn capture_screen() -> CaptureResult<PathBuf> {
+    let (path, _) = capture_monitor_at_cursor()?;
+    Ok(path)
 }
 
 /// Capture specific window
