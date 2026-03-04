@@ -322,6 +322,8 @@ impl Overlay {
         let _ = DestroyWindow(hwnd);
     }
 
+    /// Crop a region directly from the in-memory BGRA pixel buffer.
+    /// No disk read — the full-frame PNG may still be writing in the background.
     fn crop_region(
         &self,
         x: i32,
@@ -329,8 +331,31 @@ impl Overlay {
         width: u32,
         height: u32,
     ) -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
-        let img = image::open(&self.capture_path)?;
-        let cropped = img.crop_imm(x as u32, y as u32, width, height);
+        // Clamp to pixel buffer bounds
+        let x = x.max(0) as u32;
+        let y = y.max(0) as u32;
+        let width = width.min(self.pixel_width.saturating_sub(x));
+        let height = height.min(self.pixel_height.saturating_sub(y));
+
+        if width == 0 || height == 0 {
+            return Err("Selection too small".into());
+        }
+
+        // Extract the selected rectangle from the BGRA buffer
+        let src_stride = (self.pixel_width * 4) as usize;
+        let mut cropped = Vec::with_capacity((width * height * 4) as usize);
+
+        for row in 0..height {
+            let src_y = (y + row) as usize;
+            let start = src_y * src_stride + (x as usize) * 4;
+            let end = start + (width as usize) * 4;
+            cropped.extend_from_slice(&self.pixels[start..end]);
+        }
+
+        // BGRA → RGBA for PNG output
+        for chunk in cropped.chunks_exact_mut(4) {
+            chunk.swap(0, 2);
+        }
 
         let temp_dir = std::env::temp_dir().join("FSP");
         std::fs::create_dir_all(&temp_dir)?;
@@ -339,7 +364,9 @@ impl Overlay {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis();
         let path = temp_dir.join(format!("region_{}.png", timestamp));
-        cropped.save(&path)?;
+
+        // Crop regions are small — synchronous write is fine
+        image::save_buffer(&path, &cropped, width, height, image::ColorType::Rgba8)?;
         Ok(path)
     }
 

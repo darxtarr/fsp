@@ -27,18 +27,35 @@ const HOTKEY_PRINT_SCREEN: i32 = 1;
 const HOTKEY_ALT_PRINT_SCREEN: i32 = 2;
 const WM_TRAY_ICON: u32 = WM_USER + 1;
 
+/// Guard against re-entrant hotkey handling. The overlay runs a nested message
+/// loop that receives WM_HOTKEY — without this flag, pressing PrintScreen while
+/// the overlay is up creates stacked overlays that can't be dismissed.
+static mut OVERLAY_ACTIVE: bool = false;
+
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_HOTKEY => {
+            if OVERLAY_ACTIVE {
+                return LRESULT(0);
+            }
             match wparam.0 as i32 {
                 HOTKEY_PRINT_SCREEN => {
+                    let t0 = std::time::Instant::now();
                     if let Ok((path, rect, pixels, pw, ph)) = crate::capture::capture_monitor_at_cursor() {
-                        let _ = crate::overlay::Overlay::new(path, rect, pixels, pw, ph).show_and_select();
-                        // Phase 4: wire selection result to editor + toolbar
+                        let t1 = std::time::Instant::now();
+                        OVERLAY_ACTIVE = true;
+                        let _selection = crate::overlay::Overlay::new(path, rect, pixels, pw, ph).show_and_select();
+                        OVERLAY_ACTIVE = false;
+                        let t2 = std::time::Instant::now();
+                        log_timing(
+                            t1.duration_since(t0).as_millis(),
+                            t2.duration_since(t1).as_millis(),
+                            t2.duration_since(t0).as_millis(),
+                        );
+                        // Phase 3: wire selection result to editor + toolbar
                     }
                 }
                 HOTKEY_ALT_PRINT_SCREEN => {
-                    // Capture active window; editor wired in Phase 4
                     let _ = crate::capture::capture_active_window();
                 }
                 _ => {}
@@ -72,6 +89,24 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// Append timing data to %TEMP%\FSP\timing.log.
+/// capture_ms: hotkey → pixels in RAM (BitBlt + GetDIBits + clone, no PNG)
+/// overlay_ms: overlay shown → selection complete (includes user interaction time)
+/// total_ms:   hotkey → selection complete
+fn log_timing(capture_ms: u128, overlay_ms: u128, total_ms: u128) {
+    let _ = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("FSP");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("timing.log"))?;
+        writeln!(f, "capture={}ms overlay={}ms total={}ms", capture_ms, overlay_ms, total_ms)?;
+        Ok(())
+    })();
 }
 
 fn main() -> windows::core::Result<()> {

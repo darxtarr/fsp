@@ -221,9 +221,10 @@ Anything that risks breaking this timeline is cut or deferred to "Open in...".
 PrintScreen pressed
     ↓
 GetCursorPos → MonitorFromPoint → GetMonitorInfo
-Capture ONLY that monitor → write PNG to %TEMP%\FSP\ → free RAM
+Capture ONLY that monitor → RAM frame slot (BGRA, bounded pool)
     ↓
-Dim overlay appears on THAT monitor only (crosshair cursor)
+Dim overlay appears from RAM immediately (no disk wait)
+Background: queue PNG write to %TEMP%\FSP\
 User drags to select region  [Esc = cancel, Enter/dblclick = full monitor]
     ↓
 Overlay closes, screen returns to normal
@@ -234,7 +235,7 @@ Floating toolbar appears (last known position, always-on-top)
 User annotates: draws on editor window, tools from floating toolbar
 Toolbar can be dragged to any monitor at any time
     ↓
-Copy  → load PNG + rasterize annotations → clipboard → done
+Copy  → rasterize annotations (RAM frame or disk fallback) → clipboard → done
 Save  → same but writes to %USERPROFILE%\Pictures\Screenshots\
 Open in... → rasterize → launch external app with temp file
     ↓
@@ -282,42 +283,28 @@ tray menu should always surface a "Delete all captures now" action.
 
 ---
 
-### OI-2 · Internal Image Format: Speed vs. File Size
+### OI-2 · Internal Image Format: Speed vs. File Size — PARTIALLY RESOLVED
 
-**Current state (temporary):**
-Captures are written as PNG with `CompressionType::Fast` + `FilterType::NoFilter`.
-This keeps the overlay latency acceptable but produces large files — a typical
-1080p+ full-monitor capture lands around 10 MB. A 4K capture can hit 20–30 MB.
+**Resolution (March 2026):**
+The RAM-first capture pipeline (see `CAPTURE_PIPELINE.md`) eliminates the core
+problem. The overlay now displays from a BGRA frame in RAM — no PNG encode in the
+hot path at all. PNG is written asynchronously in a background thread while the
+user interacts with the overlay.
 
-**The real problem:**
-The current flow does PNG twice — fast-write for the overlay, and again when the
-user exports the cropped region. We are paying the PNG tax on the full monitor
-even though the user usually exports only a small region.
+**What this solves:**
+- No "PNG tax" blocking overlay display.
+- No double-encode (the old flow wrote PNG for overlay, then re-read it for crop).
+- Overlay latency is now bounded by BitBlt + window creation, not by encode speed.
 
-**Ideas in play (none researched properly yet):**
+**What remains open:**
+- The background spool still uses PNG. This is fine for now — encode time doesn't
+  matter when it's async. If profiling shows the background thread can't sustain
+  5+ captures/second bursts, consider QOI or raw BGRA for the spool. But don't
+  optimize this until it's measured as a bottleneck.
+- Export format is PNG (user-facing). No change planned.
 
-1. **Two-phase compression:** Write with `Fast` now so the overlay appears
-   immediately, then re-compress to level 6+ in a background thread while the
-   user annotates. The re-compressed file replaces the fast one before export.
-   Zero UX impact if annotation takes > 1 s (it always does).
-
-2. **Fast internal format, PNG only at export:** Store the full-monitor capture in
-   a lossless-but-fast intermediate format (candidates: QOI, raw BGRA + header,
-   uncompressed BMP) and only produce a PNG when the user crops and exports.
-   The internal file is ephemeral and deleted after the session.
-
-3. **Only save the selected region:** After the user draws the crop rectangle,
-   discard everything outside it and write only the cropped PNG. Eliminates the
-   full-frame overhead entirely. Downside: user cannot re-crop after closing the
-   overlay.
-
-**Format research needed (SOTA as of early 2026):**
-No homework done yet. Before deciding, evaluate: QOI (simple, fast, ~20 % larger
-than PNG-6), AVIF lossless (very dense, slow encoder), JXL lossless (dense + fast
-decode, moderate encode), WebP lossless (good tooling), raw BGRA (fastest but
-largest — ~14 MB for 1080p, ~33 MB for 4K). Decision should be driven by
-encode-speed benchmarks on a typical CloudPC CPU, not desktop benchmarks.
-
-**TODO (code):** see `capture.rs` inside `save_bitmap_to_file()` for the inline note.
+**Rejected alternatives:** QOI (adds dependency, nothing reads it natively),
+raw BGRA (32MB per 4K frame on disk), two-phase compression (unnecessary when
+persistence is fully async). See `CAPTURE_PIPELINE.md` "Rejected Alternatives".
 
 ---
