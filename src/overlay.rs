@@ -28,8 +28,19 @@ use windows::{
 
 #[derive(Debug, Clone)]
 pub enum Selection {
-    Region { x: i32, y: i32, width: u32, height: u32, image_path: PathBuf },
-    FullScreen { image_path: PathBuf },
+    Region {
+        x: i32, y: i32, width: u32, height: u32,
+        image_path: PathBuf,
+        pixels: Vec<u8>,
+        pixel_width: u32,
+        pixel_height: u32,
+    },
+    FullScreen {
+        image_path: PathBuf,
+        pixels: Vec<u8>,
+        pixel_width: u32,
+        pixel_height: u32,
+    },
     Cancelled,
 }
 
@@ -302,10 +313,13 @@ impl Overlay {
         }
 
         match self.crop_region(left, top, width, height) {
-            Ok(path) => {
+            Ok((path, cropped_bgra, cw, ch)) => {
                 self.selection_result = Some(Selection::Region {
                     x: left, y: top, width, height,
                     image_path: path,
+                    pixels: cropped_bgra,
+                    pixel_width: cw,
+                    pixel_height: ch,
                 });
             }
             Err(_) => {
@@ -318,19 +332,23 @@ impl Overlay {
     unsafe fn handle_full_screen_selection(&mut self, hwnd: HWND) {
         self.selection_result = Some(Selection::FullScreen {
             image_path: self.capture_path.clone(),
+            pixels: std::mem::take(&mut self.pixels),
+            pixel_width: self.pixel_width,
+            pixel_height: self.pixel_height,
         });
         let _ = DestroyWindow(hwnd);
     }
 
     /// Crop a region directly from the in-memory BGRA pixel buffer.
     /// No disk read — the full-frame PNG may still be writing in the background.
+    /// Returns (path, cropped_bgra, width, height).
     fn crop_region(
         &self,
         x: i32,
         y: i32,
         width: u32,
         height: u32,
-    ) -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(PathBuf, Vec<u8>, u32, u32), Box<dyn std::error::Error>> {
         // Clamp to pixel buffer bounds
         let x = x.max(0) as u32;
         let y = y.max(0) as u32;
@@ -343,17 +361,20 @@ impl Overlay {
 
         // Extract the selected rectangle from the BGRA buffer
         let src_stride = (self.pixel_width * 4) as usize;
-        let mut cropped = Vec::with_capacity((width * height * 4) as usize);
+        let mut cropped_bgra = Vec::with_capacity((width * height * 4) as usize);
 
         for row in 0..height {
             let src_y = (y + row) as usize;
             let start = src_y * src_stride + (x as usize) * 4;
             let end = start + (width as usize) * 4;
-            cropped.extend_from_slice(&self.pixels[start..end]);
+            cropped_bgra.extend_from_slice(&self.pixels[start..end]);
         }
 
+        // Clone BGRA for the editor before converting to RGBA for PNG
+        let bgra_for_editor = cropped_bgra.clone();
+
         // BGRA → RGBA for PNG output
-        for chunk in cropped.chunks_exact_mut(4) {
+        for chunk in cropped_bgra.chunks_exact_mut(4) {
             chunk.swap(0, 2);
         }
 
@@ -366,8 +387,8 @@ impl Overlay {
         let path = temp_dir.join(format!("region_{}.png", timestamp));
 
         // Crop regions are small — synchronous write is fine
-        image::save_buffer(&path, &cropped, width, height, image::ColorType::Rgba8)?;
-        Ok(path)
+        image::save_buffer(&path, &cropped_bgra, width, height, image::ColorType::Rgba8)?;
+        Ok((path, bgra_for_editor, width, height))
     }
 
     unsafe fn cleanup_bitmaps(&self) {
@@ -381,7 +402,7 @@ impl Overlay {
 }
 
 /// Build a GDI memory DC from raw BGRA pixel data (no file I/O, no decode).
-unsafe fn load_screenshot_bitmap_from_raw(
+pub unsafe fn load_screenshot_bitmap_from_raw(
     bgra: &[u8],
     width: i32,
     height: i32,

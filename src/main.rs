@@ -21,6 +21,7 @@ mod capture;
 mod overlay;
 mod annotation;
 mod clipboard;
+mod editor;
 mod settings;
 
 const HOTKEY_PRINT_SCREEN: i32 = 1;
@@ -43,8 +44,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     let t0 = std::time::Instant::now();
                     if let Ok((path, rect, pixels, pw, ph)) = crate::capture::capture_monitor_at_cursor() {
                         let t1 = std::time::Instant::now();
+                        // Close existing editor before new capture
+                        crate::editor::close();
                         OVERLAY_ACTIVE = true;
-                        let _selection = crate::overlay::Overlay::new(path, rect, pixels, pw, ph).show_and_select();
+                        let selection = crate::overlay::Overlay::new(path, rect, pixels, pw, ph).show_and_select();
                         OVERLAY_ACTIVE = false;
                         let t2 = std::time::Instant::now();
                         log_timing(
@@ -52,7 +55,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                             t2.duration_since(t1).as_millis(),
                             t2.duration_since(t0).as_millis(),
                         );
-                        // Phase 3: wire selection result to editor + toolbar
+                        if let Ok(sel) = selection {
+                            match sel {
+                                crate::overlay::Selection::Region { pixels, pixel_width, pixel_height, image_path, .. }
+                                | crate::overlay::Selection::FullScreen { pixels, pixel_width, pixel_height, image_path } => {
+                                    let _ = crate::editor::open(pixels, pixel_width, pixel_height, image_path);
+                                }
+                                crate::overlay::Selection::Cancelled => {}
+                            }
+                        }
                     }
                 }
                 HOTKEY_ALT_PRINT_SCREEN => {
